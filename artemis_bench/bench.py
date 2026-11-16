@@ -15,9 +15,12 @@ How it stays honest:
   output folder, /tmp and $HOME are private and empty, no network. So the code
   under test cannot edit the harness, golden data, venv or checkout, and cannot
   carry a cache from one repeat to the next.
-- The headline clock runs from spawning the worker to reading "ARTEMIS_DONE
-  <nonce>", so work moved into import time counts; the call alone (nonce to
-  done) is reported too. Saving outputs is outside.
+- The headline clock runs from spawning the worker to the worker's exit, so
+  work moved into import time counts and code under test cannot stop the clock
+  early; the call alone (nonce to exit, which includes saving ~10 MB of
+  outputs) is reported too.
+- Golden data and git history are hidden inside the sandbox, and outputs are
+  read without following symlinks, so a version cannot copy the answers.
 - One checked, untimed warm-up repeat, then the median of BENCH_REPEATS (5).
 - Every repeat's parameters, log-likelihoods, standard errors, fitted
   volatilities and residuals, for every asset, are compared with golden
@@ -25,9 +28,10 @@ How it stays honest:
   first worker starts. The harness, its data, the golden files and the venv
   must be unchanged after the run.
 - This process is a child subreaper: a worker may leave no process behind.
-- Single-threaded: CPU over wall across the timed call, summed over the whole
-  process tree under the sandbox, must stay under 1.3, and the tree may hold
-  only the sandbox's own processes plus the one worker.
+- Single-threaded: CPU over wall from spawn to exit, from the rusage of the
+  reaped process tree, must stay under 1.3; the tree may hold only the
+  sandbox's bwrap (known by PID) plus the one worker, and nothing may be left
+  when it exits.
 - A canary (an eigh on a fixed matrix, in this process) shows machine noise.
 """
 import os
@@ -55,8 +59,8 @@ import numpy as np  # noqa: E402
 import scipy.linalg  # noqa: E402
 
 from compare import (Integrity, become_subreaper, child_limits, descendants,  # noqa: E402
-                     fit_tier, kill_descendants, load_npz, read_golden, run_main,
-                     sandboxed, tree_cpu_seconds, worker_argv)
+                     fit_tier, kill_descendants, load_npz, read_golden, read_output,
+                     run_main, sandboxed, worker_argv)
 from gate import SEED_SOURCES_SHA256, sources_sha  # noqa: E402
 
 INTEGRITY = Integrity()
@@ -76,7 +80,12 @@ def repo_files():
 
 
 def run_once(mode, outdir):
-    """One fresh sandboxed worker: (spawn-to-done s, timed-call s, cpu/wall in the call)."""
+    """One fresh sandboxed worker: (spawn-to-exit s, nonce-to-exit s, cpu/wall).
+
+    The clock stops when the worker process has exited (outputs saved), not at a
+    line it prints, so code under test cannot stop the clock early. CPU over wall
+    covers the whole span from spawn to exit, from the rusage of the reaped
+    process tree, so parallel work before READY counts too."""
     spawn = time.perf_counter()
     p = subprocess.Popen(sandboxed(worker_argv(mode, outdir), outdir), stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, text=True, bufsize=1, preexec_fn=child_limits,
@@ -90,36 +99,35 @@ def run_once(mode, outdir):
     else:
         sys.exit("bench: %s worker never became ready" % mode)
     nonce = secrets.token_hex(16)
-    c0 = tree_cpu_seconds(p.pid)
     t0 = time.perf_counter()
     p.stdin.write(nonce + "\n")
     p.stdin.flush()
-    t1 = c1 = None
+    done = False
     for line in p.stdout:
         if line.strip() == "ARTEMIS_DONE " + nonce:
-            t1 = time.perf_counter()
-            c1 = tree_cpu_seconds(p.pid)
-            procs = descendants(with_comm=True)
+            done = True
+            # the sandbox's own process is bwrap itself (p.pid, known by PID); the
+            # worker runs directly below it, and anything beyond that one is extra
+            extra = descendants() - {p.pid}
             break
-    if t1 is None:
-        p.kill()
-        p.wait()
-        if not watchdog.is_alive():
+    p.stdout.read()
+    _, status, ru = os.wait4(p.pid, 0)
+    t_exit = time.perf_counter()
+    watchdog.cancel()
+    left = descendants()
+    kill_descendants()
+    if not done:
+        if not watchdog.is_alive() and t_exit - spawn >= WORKER_TIMEOUT_S:
             sys.exit("bench: %s worker took over %d s; failing" % (mode, WORKER_TIMEOUT_S))
         sys.exit("bench: %s worker ended without finishing the timed call" % mode)
-    p.stdout.read()
-    _, status, _ = os.wait4(p.pid, 0)
-    watchdog.cancel()
-    kill_descendants()
-    workers = [pid for pid, comm in procs.items() if comm != "bwrap"]
-    if len(workers) > 1:
-        sys.exit("bench: %s worker had %d processes alive at the end of the timed call %s; "
-                 "the benchmark is single-process" % (mode, len(workers), sorted(procs.items())))
+    if len(extra) > 1 or left:
+        sys.exit("bench: %s worker ran extra processes %s (left at exit: %s); the benchmark "
+                 "is single-process" % (mode, sorted(extra), sorted(left)))
     code = os.waitstatus_to_exitcode(status)
     if code != 0:
         sys.exit("bench: %s worker exited %d" % (mode, code))
-    ratio = (c1 - c0) / (t1 - t0) if t1 - t0 > 0.5 else 0.0  # 10 ms ticks: judge only > 0.5 s
-    return t1 - spawn, t1 - t0, ratio
+    ratio = (ru.ru_utime + ru.ru_stime) / (t_exit - spawn)
+    return t_exit - spawn, t_exit - t0, ratio
 
 
 def check(mode, out_blob, gold_blob):
@@ -160,8 +168,10 @@ def main():
                 out = tempfile.mkdtemp(prefix="garchbench-")
                 try:
                     total, call, ratio = run_once(mode, out)
-                    with open(os.path.join(out, mode + ".npz"), "rb") as fh:
-                        blob = fh.read()
+                    try:
+                        blob = read_output(os.path.join(out, mode + ".npz"))
+                    except OSError as exc:
+                        sys.exit("bench: refusing %s worker output (%s)" % (mode, exc))
                     if record:
                         os.makedirs(GOLDEN, exist_ok=True)
                         with open(os.path.join(GOLDEN, mode + ".npz"), "wb") as fh:
@@ -213,7 +223,7 @@ def main():
         "garch_book_cv": cv(times["panel"]),
         "gjr_t_book_cv": cv(times["gjr_t"]),
         "canary_eigh_cv": cv(times["canary"]),
-        "max_cpu_over_wall": worst_ratio,
+        "max_cpu_over_wall": worst_ratio,  # spawn to exit, whole tree
     }
     with open(os.path.join(os.getcwd(), "artemis_results.json"), "w") as fh:
         json.dump(res, fh, indent=1)

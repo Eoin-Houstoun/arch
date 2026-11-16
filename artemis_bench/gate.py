@@ -32,7 +32,7 @@ sys.path.insert(0, HERE)
 
 
 from compare import (Integrity, become_subreaper, child_limits, compare_case,  # noqa: E402
-                     kill_descendants, load_npz, read_golden, run_main, sandboxed,
+                     kill_descendants, load_npz, read_golden, read_output, run_main, sandboxed,
                      worker_argv)
 
 INTEGRITY = Integrity()
@@ -90,8 +90,10 @@ def main():
             sys.exit("gate: worker exited %d" % rc)
         results = {}
         for f in sorted(os.listdir(out)):
-            with open(os.path.join(out, f), "rb") as fh:
-                results[f] = fh.read()
+            try:
+                results[f] = read_output(os.path.join(out, f))
+            except OSError as exc:
+                sys.exit("gate: refusing worker output %s (%s)" % (f, exc))
         if record:
             bad = [f for f, b in results.items() if "error" in load_npz(b)]
             if bad or len(results) != EXPECTED_CASES:

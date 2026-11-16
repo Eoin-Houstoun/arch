@@ -77,6 +77,24 @@ def _cached(f):
     return g
 '''
 
+EARLY_DONE = (
+    "\nimport sys as _s\n_orig_fit = ARCHModel.fit\n_sent = []\n\n\n"
+    "def _fit(self, *a, **k):\n"
+    "    if not _sent:\n"
+    "        f = _s._getframe()\n"
+    "        while f is not None:\n"
+    "            if 'nonce' in f.f_locals:\n"
+    "                print('ARTEMIS_DONE ' + f.f_locals['nonce'], flush=True)\n"
+    "                _sent.append(1)\n"
+    "                break\n"
+    "            f = f.f_back\n"
+    "    return _orig_fit(self, *a, **k)\n\n\nARCHModel.fit = _fit\n")
+SAVE = ("    np.savez(os.path.join(outdir, mode + \".npz\"),\n"
+        "             **{k: np.stack([o[k] for o in outs]) for k in outs[0]})\n")
+GOLD = "os.path.join(HERE, 'golden', 'bench', mode + '.npz')"
+COPY_GOLDEN = "    import shutil\n    shutil.copy(%s, os.path.join(outdir, mode + '.npz'))\n" % GOLD
+LINK_GOLDEN = "    os.symlink(%s, os.path.join(outdir, mode + '.npz'))\n" % GOLD
+
 GATE_FAULTS = {
     "GARCH recursion looks ahead one day": ("recursions.pyx", after(
         "def garch_recursion(",
@@ -96,8 +114,10 @@ GATE_FAULTS = {
     "child patches numpy + drops log(2 pi)": ("distribution.py",
                                              append(PATCH_ALLCLOSE, NO_LOG2PI[1])),
     "child edits golden + drops log(2 pi)": ("distribution.py", append(EDIT_GOLDEN, NO_LOG2PI[1])),
-    "child edits golden, result correct": ("distribution.py", append(EDIT_GOLDEN)),
 }
+# Golden data is hidden inside the sandbox, so this must change nothing: the gate
+# passes and the golden files stay byte-identical.
+EDIT_GOLDEN_CORRECT = ("distribution.py", append(EDIT_GOLDEN))
 
 
 def run(cmd, extra_env=None, timeout=1800):
@@ -174,6 +194,20 @@ def main():
             if fname.endswith(".pyx"):
                 build()
 
+        fname, patch = EDIT_GOLDEN_CORRECT
+        with open(FILES[fname], "w") as fh:
+            fh.write(patch(seeds[fname]))
+        rc, out = gate()
+        same = all(
+            open(os.path.join(dp, f), "rb").read() == open(os.path.join(
+                backup, os.path.relpath(dp, golden_dir), f), "rb").read()
+            for dp, _, fs in os.walk(golden_dir) for f in fs)
+        restore()
+        ok &= rc == 0 and same
+        print("gate  fault %-40s %s  gate %s, golden %s" % (
+            "child edits golden, result correct", "NO EFFECT" if rc == 0 and same else "PROBLEM",
+            "passes" if rc == 0 else "fails", "unchanged" if same else "CHANGED"))
+
         if "--bench" in sys.argv:
             rc, out = bench()
             base = headline() if rc == 0 else None
@@ -187,11 +221,26 @@ def main():
             print("bench fault %-38s %s  %s" % ("child patches numpy + drops log(2 pi)",
                                                  "CAUGHT" if rc else "MISSED", first_fail(out)[:90]))
             restore()
+            for label, text in (("output copied from golden", COPY_GOLDEN),
+                                ("output symlinked to golden", LINK_GOLDEN)):
+                with open(worker_py, "w") as fh:
+                    fh.write(worker_seed.replace(SAVE, text))
+                rc, out = bench()
+                with open(worker_py, "w") as fh:
+                    fh.write(worker_seed)
+                restore()
+                ok &= rc != 0
+                print("bench fault %-38s %s  %s" % (label, "CAUGHT" if rc else "MISSED",
+                                                     first_fail(out)[:90]))
             for label, kind in (("timers scaled x0.25", "timers"),
-                                ("results cached across repeats", "cache")):
+                                ("results cached across repeats", "cache"),
+                                ("DONE printed early from arch", "early")):
                 if kind == "timers":
                     with open(FILES["distribution.py"], "w") as fh:
                         fh.write(append(PATCH_TIMERS)(seeds["distribution.py"]))
+                elif kind == "early":
+                    with open(FILES["base.py"], "w") as fh:
+                        fh.write(append(EARLY_DONE)(seeds["base.py"]))
                 else:
                     with open(worker_py, "w") as fh:
                         fh.write(worker_seed.replace(

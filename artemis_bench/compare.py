@@ -8,6 +8,7 @@ import hashlib
 import io
 import os
 import resource
+import stat
 import subprocess
 import sys
 
@@ -34,7 +35,8 @@ def child_limits():
 def sandboxed(argv, outdir, cwd=None):
     """argv wrapped in bubblewrap: the whole filesystem read-only, a private /tmp and
     /run, $HOME hidden, no network, own PID/IPC/user namespaces, new session, no
-    capabilities, clean environment. The worker can write only `outdir`.
+    capabilities, clean environment. The worker runs as PID 1 of its namespace and can
+    write only `outdir`.
 
     So code under test cannot edit the harness, its golden data, the venv or the
     checkout, and nothing it writes outlives one worker (no cache across repeats)."""
@@ -50,9 +52,36 @@ def sandboxed(argv, outdir, cwd=None):
         "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", home]
     for p in readable:
         cmd += ["--ro-bind", p, p]
-    cmd += ["--bind", outdir, outdir, "--unshare-all", "--new-session", "--die-with-parent",
+    # the answers stay out of reach: golden data (and git history, which holds a copy)
+    # are hidden from the worker, so a version cannot copy them into its output
+    for hidden in (os.path.join(HERE, "golden"), os.path.join(ROOT, ".git")):
+        if os.path.isdir(hidden):
+            cmd += ["--tmpfs", hidden]
+        elif os.path.exists(hidden):
+            cmd += ["--ro-bind", "/dev/null", hidden]
+    # --as-pid-1: no bubblewrap init in between, so the outer bwrap reaps the worker
+    # itself and the worker's CPU time arrives in the parent's wait4 rusage
+    cmd += ["--bind", outdir, outdir, "--unshare-all", "--as-pid-1", "--new-session",
+            "--die-with-parent",
             "--cap-drop", "ALL", "--chdir", cwd or outdir]
     return cmd + argv
+
+
+MAX_OUTPUT_BYTES = 256 << 20
+
+
+def read_output(path):
+    """Bytes of one worker output: a regular file with one link, opened without
+    following symlinks, so a worker cannot point the parent at another file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > MAX_OUTPUT_BYTES:
+            raise OSError("not a plain output file: %s" % path)
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read()
+    finally:
+        os.close(fd)
 
 
 def worker_argv(*args):
@@ -172,24 +201,6 @@ def kill_descendants():
     return found
 
 
-def tree_cpu_seconds(pid):
-    """utime+stime (all threads, plus reaped children) over the whole process tree under
-    pid: the worker runs below two bubblewrap processes."""
-    total, stack = 0, [pid]
-    while stack:
-        p = stack.pop()
-        try:
-            with open("/proc/%d/stat" % p) as fh:
-                fields = fh.read().rsplit(")", 1)[1].split()
-            total += sum(int(x) for x in fields[11:15])
-            for tid in os.listdir("/proc/%d/task" % p):
-                with open("/proc/%d/task/%s/children" % (p, tid)) as fh:
-                    stack += [int(c) for c in fh.read().split()]
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-    return total / os.sysconf("SC_CLK_TCK")
-
-
 class Integrity:
     """Baseline of the harness, golden data and venv, checked on EVERY exit path."""
 
@@ -237,20 +248,23 @@ def run_main(main, integrity):
 # Quantities at FIXED parameters (log-likelihood, conditional volatility, forecasts)
 # do not depend on the optimiser, so they must match to rounding: rtol 1e-10.
 FIXED_RTOL = 1e-10
-# Fitted quantities may move with a different (better) optimiser path. Tiers:
+# Fitted quantities may move with a different (better) optimiser path. Parameter
+# moves are measured in units of the seed's standard error for that parameter: on a
+# flat likelihood ridge an honest optimiser change moves a parameter ~5e-4 of its
+# value at an identical log-likelihood (measured with an analytic score), which is
+# ~1e-4 of a standard error, statistically invisible. Tiers:
 #   0  bit-identical to the seed
-#   1  params within 1e-6 rel (+1e-8 abs), log-likelihood within 1e-10 rel,
-#      std errors within 1e-5 rel, fitted volatility within 1e-6 rel and residuals
-#      within 1e-6 of their largest magnitude (a residual near zero has no useful
-#      relative error: it moves with the fitted mean)
-#   2  params within 1e-4 rel (+1e-6 abs), log-likelihood no worse than the seed's by
-#      more than 1e-9 rel, std errors within 1e-3 rel (the seed's std errors come from a
-#      finite-difference Hessian), fitted volatility within 1e-4 rel and residuals
-#      within 1e-4 of their largest magnitude
+#   1  params within 1e-4 standard errors, log-likelihood within 1e-10 rel, std errors
+#      within 1e-5 rel, fitted volatility within 1e-6 rel, residuals within 1e-6 of
+#      their largest magnitude (a residual near zero has no useful relative error)
+#   2  params within 0.01 standard errors, log-likelihood no worse than the seed's by
+#      more than 1e-9 rel, std errors within 1e-3 rel (the seed's come from a
+#      finite-difference Hessian), fitted volatility within 1e-3 rel, residuals within
+#      1e-3 of their largest magnitude
 # Anything outside tier 2 fails.
 TIERS = {
-    1: dict(params=(1e-6, 1e-8), llf=1e-10, se=1e-5, path=1e-6),
-    2: dict(params=(1e-4, 1e-6), llf=1e-9, se=1e-3, path=1e-4),
+    1: dict(params_se=1e-4, llf=1e-10, se=1e-5, path=1e-6),
+    2: dict(params_se=1e-2, llf=1e-9, se=1e-3, path=1e-3),
 }
 FIXED_KEYS = ("fx_llf", "fx_cvol", "fx_fcast")
 FIT_KEYS = ("params", "llf", "se", "cvol", "resid")
@@ -278,19 +292,31 @@ def _within(a, b, rtol, atol=0.0):
     return bool(np.all(np.abs(a[fb] - b[fb]) <= rtol * np.abs(b[fb]) + atol))
 
 
+def _params_in_se(out, gold):
+    """Largest parameter move in units of the seed's standard error (inf if a seed
+    standard error is not positive and finite and the parameter moved)."""
+    d = np.abs(out["params"] - gold["params"])
+    se = gold["se"]
+    ok = np.isfinite(se) & (se > 0)
+    if np.any(d[~ok] > 0) or not np.all(np.isfinite(out["params"])):
+        return float("inf")
+    return float(np.max(d[ok] / se[ok])) if np.any(ok) else 0.0
+
+
 def fit_tier(out, gold):
     """(tier, worst-change text) for one fit; tier 3 means outside every tier."""
     if all(np.array_equal(out[k], gold[k], equal_nan=True) for k in FIT_KEYS):
         return 0, "identical"
-    why = "params %.1e rel, llf %+.1e rel, se %.1e rel" % (
-        _rel(out["params"], gold["params"]),
+    dp_se = _params_in_se(out, gold)
+    why = "params %.1e rel (%.1e std errs), llf %+.1e rel, se %.1e rel" % (
+        _rel(out["params"], gold["params"]), dp_se,
         float(np.max((out["llf"] - gold["llf"]) / np.abs(gold["llf"]))),
         _rel(out["se"], gold["se"]))
     for tier in (1, 2):
         t = TIERS[tier]
         llf_ok = (_within(out["llf"], gold["llf"], t["llf"]) if tier == 1 else
                   bool(np.all(out["llf"] >= gold["llf"] - t["llf"] * np.abs(gold["llf"]))))
-        if (_within(out["params"], gold["params"], *t["params"]) and llf_ok
+        if (dp_se <= t["params_se"] and llf_ok
                 and _within(out["se"], gold["se"], t["se"])
                 and _within(out["cvol"], gold["cvol"], t["path"])
                 and _within(out["resid"], gold["resid"], 0.0,
