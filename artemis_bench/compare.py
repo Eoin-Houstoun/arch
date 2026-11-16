@@ -72,8 +72,10 @@ MAX_OUTPUT_BYTES = 256 << 20
 
 def read_output(path):
     """Bytes of one worker output: a regular file with one link, opened without
-    following symlinks, so a worker cannot point the parent at another file."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    following symlinks or blocking, so a worker cannot point the parent at another
+    file or hang it."""
+    # O_NONBLOCK: a FIFO planted in place of an output cannot block the parent
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > MAX_OUTPUT_BYTES:

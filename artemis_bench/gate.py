@@ -89,7 +89,10 @@ def main():
             sys.stderr.write(log[-3000:])
             sys.exit("gate: worker exited %d" % rc)
         results = {}
+        expected = set(golden) if golden else None
         for f in sorted(os.listdir(out)):
+            if expected is not None and f not in expected:
+                sys.exit("gate: unexpected worker output %r" % f)
             try:
                 results[f] = read_output(os.path.join(out, f))
             except OSError as exc:
